@@ -63,6 +63,8 @@ class Buffer:
         return self.mglo.read(size, offset)
 
     def read_into(self, buffer, size=-1, offset=0, write_offset=0):
+        if hasattr(buffer, 'fileno'):
+            buffer = buffer.fileno()
         return self.mglo.read_into(buffer, size, offset, write_offset)
 
     def read_chunks(self, chunk_size, start, step, count):

@@ -963,6 +963,54 @@ static PyObject * MGLBuffer_read(MGLBuffer * self, PyObject * args) {
     return data;
 }
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unistd.h>
+#include <iostream>
+
+static std::thread worker_thread;
+static int frame_fd = -1;
+static void *frame_data = nullptr;
+static size_t frame_size = 0;
+static std::mutex frame_mutex;
+static std::condition_variable frame_cv;
+static bool worker_thread_running = false;
+
+void worker_thread_function() {
+    std::unique_lock<std::mutex> lock(frame_mutex);
+
+    while (true) {
+        frame_cv.wait(lock, [] { return frame_data != nullptr ; });
+
+        if (frame_data != nullptr) {
+
+            // Copy this work's instructions
+            void *data = frame_data;
+            size_t size = frame_size;
+            int fd = frame_fd;
+
+            // Allow other frame to be written
+            frame_data = nullptr;
+            lock.unlock();
+
+            // Write in chunks of 4K for performance
+            size_t tell = 0;
+            while (tell < size) {
+                size_t chunk = std::min(size - tell, (size_t) 4096);
+                ssize_t written = write(fd, (char *)data + tell, chunk);
+                if (written == -1) {
+                    break;
+                }
+                tell += written;
+            }
+
+            frame_cv.notify_all();
+            lock.lock();
+        }
+    }
+}
+
 static PyObject * MGLBuffer_read_into(MGLBuffer * self, PyObject * args) {
     PyObject * data;
     Py_ssize_t size;
@@ -991,31 +1039,56 @@ static PyObject * MGLBuffer_read_into(MGLBuffer * self, PyObject * args) {
         return 0;
     }
 
-    Py_buffer buffer_view;
+    if (PyLong_Check(data)) {
+        int fd = PyLong_AsLong(data);
+        if (fd == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
 
-    int get_buffer = PyObject_GetBuffer(data, &buffer_view, PyBUF_WRITABLE);
-    if (get_buffer < 0) {
-        // Propagate the default error
-        return 0;
-    }
+        const GLMethods & gl = self->context->gl;
+        gl.BindBuffer(GL_ARRAY_BUFFER, self->buffer_obj);
+        void *map = gl.MapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_READ_BIT);
 
-    if (buffer_view.len < write_offset + size) {
-        MGLError_Set("the buffer is too small");
+        /* Send a work to write */ {
+            std::unique_lock<std::mutex> lock(frame_mutex);
+            frame_cv.wait(lock, [] { return frame_data == nullptr; });
+            frame_fd = fd;
+            frame_data = map;
+            frame_size = size;
+            frame_cv.notify_one();
+        }
+
+        gl.UnmapBuffer(GL_ARRAY_BUFFER);
+
+        if (!worker_thread_running) {
+            worker_thread_running = true;
+            worker_thread = std::thread(worker_thread_function);
+            worker_thread.detach();
+        }
+    } else {
+        Py_buffer buffer_view;
+        int get_buffer = PyObject_GetBuffer(data, &buffer_view, PyBUF_WRITABLE);
+        if (get_buffer < 0) {
+            return 0;
+        }
+
+        if (buffer_view.len < write_offset + size) {
+            MGLError_Set("the buffer is too small");
+            PyBuffer_Release(&buffer_view);
+            return 0;
+        }
+
+        const GLMethods & gl = self->context->gl;
+        gl.BindBuffer(GL_ARRAY_BUFFER, self->buffer_obj);
+        void *map = gl.MapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_READ_BIT);
+
+        char *ptr = (char *)buffer_view.buf + write_offset;
+        memcpy(ptr, map, size);
+
+        gl.UnmapBuffer(GL_ARRAY_BUFFER);
         PyBuffer_Release(&buffer_view);
-        return 0;
     }
 
-    const GLMethods & gl = self->context->gl;
-
-    gl.BindBuffer(GL_ARRAY_BUFFER, self->buffer_obj);
-    void * map = gl.MapBufferRange(GL_ARRAY_BUFFER, offset, size, GL_MAP_READ_BIT);
-
-    char * ptr = (char *)buffer_view.buf + write_offset;
-    memcpy(ptr, map, size);
-
-    gl.UnmapBuffer(GL_ARRAY_BUFFER);
-
-    PyBuffer_Release(&buffer_view);
     Py_RETURN_NONE;
 }
 
